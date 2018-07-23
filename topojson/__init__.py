@@ -1,12 +1,16 @@
+__version__ = '0.0.2'
+
 import json
 from collections import deque
 from math import inf
 from functools import reduce
 import copy
 
+from collections import Sequence
+
 class TopoExtractor():
 
-    def __init__(self, precision=1e-6):
+    def __init__(self, precision=1e-7):
         self._precision = precision
 
         self._junctions = set()
@@ -81,6 +85,13 @@ class TopoExtractor():
 
     def geomify(self, obj):
 
+        def recursive_tuple(seq):
+            for item in seq:
+                if isinstance(item, Sequence):
+                    yield tuple(recursive_tuple(item))
+                else:
+                    yield item
+
         def get_if_present(d, keys):
             if isinstance(keys, str):
                 keys = [keys]
@@ -97,7 +108,7 @@ class TopoExtractor():
             elif geo['type'] in ['Point', 'MultiPoint']:
                 output['coordinates'] = geo['coordinates']
             else:
-                output['arcs'] = geo['coordinates']
+                output['arcs'] = list(recursive_tuple(geo['coordinates']))
 
             return output
 
@@ -271,7 +282,7 @@ class TopoExtractor():
         if scale is None and n is None:
             # If no scale info is provided, default to 1e-6 degree, which should
             # be lossless for most applications but still reduce space signicantly
-            scale = [1e-6] * len(translate)
+            scale = [self._precision] * len(translate)
         elif scale is None:
             # If we just have an n, use that to compute optimal scale given our
             # bbox range
