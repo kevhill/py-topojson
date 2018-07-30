@@ -6,7 +6,7 @@ from math import inf
 from functools import reduce
 import copy
 from math import sqrt
-import rtree
+import kdtree
 
 from collections import Sequence
 
@@ -23,7 +23,10 @@ class TopoExtractor():
             self._point_match_threshold = point_match_threshold
 
         self.objects = {}
-        self._rtree = rtree.index.Index()
+
+        # TODO: allow for more than 2 dimensions
+        self._kdtree = kdtree.create(dimensions=2)
+
         self._junctions = set()
         self._neighbors = {}
         self._reset()
@@ -234,27 +237,21 @@ class TopoExtractor():
 
             p = tuple(map(lambda d: round(d / self._precision) * self._precision, p))
 
-            # TODO: generalize to multiple dimensions
-            # rtree needs all objects in (left, bottom, right, top), so double our p tuble
-            # also just grab the first entry, as
+            result = self._kdtree.search_nn(p)
 
-            #print('\nchecking ', p)
-            neighborhood = list(self._rtree.nearest(p * 2, objects=True))
-            #print([n.object for n in neighborhood])
+            # empty tree will return None on search
+            if result is not None:
 
-            if neighborhood:
-
-                nearest = neighborhood[0].object
-
-                sq_err = [(d[0] - d[1])**2 for d in zip(nearest, p)]
-                dist = sqrt(sum(sq_err))
+                # this library kindly gives us sum squared err as well
+                nearest, sse = result
+                dist = sqrt(sse)
 
                 if dist < self._point_match_threshold:
                     #print('found match ', nearest)
-                    return nearest
+                    return nearest.data
 
             #print('inserting ', p)
-            self._rtree.insert(0, p * 2, obj=p)
+            self._kdtree.add(p)
             return p
 
 
@@ -438,7 +435,7 @@ class TopoExtractor():
 
             return output
 
-        return list(map(delta_arc, self._arcs)),
+        return list(map(delta_arc, self._arcs))
 
 
     def get_topo(self):
