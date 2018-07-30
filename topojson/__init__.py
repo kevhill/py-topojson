@@ -1,4 +1,4 @@
-__version__ = '0.0.3'
+__version__ = '0.0.4'
 
 import json
 from collections import deque
@@ -6,6 +6,7 @@ from math import inf
 from functools import reduce
 import copy
 from math import sqrt
+import rtree
 
 from collections import Sequence
 
@@ -22,7 +23,7 @@ class TopoExtractor():
             self._point_match_threshold = point_match_threshold
 
         self.objects = {}
-        self._coordinates = []
+        self._rtree = rtree.index.Index()
         self._junctions = set()
         self._neighbors = {}
         self._reset()
@@ -133,12 +134,6 @@ class TopoExtractor():
             self.objects[name] = obj
 
 
-    def get_shape_coords(self, shape):
-        # return the actual coordinates for a simple shape given as a list of
-        # coordinate inedexes
-        return list(map(lambda i: self._coordinates[i], shape))
-
-
     def get_bbox(self, obj=None):
         # computes correct bboxes for geometries. If called with no object, get
         # the bounding box for the instance by looking for bounding boxes of all
@@ -163,7 +158,7 @@ class TopoExtractor():
         def minMaxShape(shape):
             min_max = None
 
-            for p in self.get_shape_coords(shape):
+            for p in shape:
                 min_max = combMinMax((p, p), min_max)
 
             return min_max
@@ -233,36 +228,49 @@ class TopoExtractor():
 
         obj = copy.deepcopy(obj)
 
-        def get_point_index(p):
-            # first map the point to our given precision, then compare with all
-            # other points based on our match_threshold
+        def map_point(p):
+            # first map the point to our given precision, then try to identify
+            # existing points within our _point_match_bound
 
             p = tuple(map(lambda d: round(d / self._precision) * self._precision, p))
 
-            for i, x in enumerate(self._coordinates):
-                sq_err = [(d[0] - d[1])**2 for d in zip(x, p)]
+            # TODO: generalize to multiple dimensions
+            # rtree needs all objects in (left, bottom, right, top), so double our p tuble
+            # also just grab the first entry, as
+
+            #print('\nchecking ', p)
+            neighborhood = list(self._rtree.nearest(p * 2, objects=True))
+            #print([n.object for n in neighborhood])
+
+            if neighborhood:
+
+                nearest = neighborhood[0].object
+
+                sq_err = [(d[0] - d[1])**2 for d in zip(nearest, p)]
                 dist = sqrt(sum(sq_err))
 
                 if dist < self._point_match_threshold:
-                    return i
+                    #print('found match ', nearest)
+                    return nearest
 
-            self._coordinates.append(p)
-            return len(self._coordinates) - 1
+            #print('inserting ', p)
+            self._rtree.insert(0, p * 2, obj=p)
+            return p
 
 
         def extract_shape(shape):
             output = []
 
             # all shapes must be tested for interior neighbors
-            for i_shp, p in enumerate(shape[1:-1]):
+            for i, p in enumerate(shape[1:-1]):
 
-                i_p = get_point_index(p)
+                p = map_point(p)
 
                 # note that `i == shape.index(p) - 1` because of array slice
-                n = set([shape[i_shp], shape[i_shp + 2]])
-                self._test_neighborhood(i_p, n)
+                n = set([shape[i], shape[i + 2]])
+                self._test_neighborhood(p, n)
 
-                output.append(i_p)
+                output.append(p)
 
             return output
 
@@ -288,14 +296,14 @@ class TopoExtractor():
         def extract_ring(ring):
             output = []
             # test neighbors of ring point
-            i = get_point_index(ring[0])
-            self._test_neighborhood(i, set([ring[1], ring[-2]]))
-            output.append(i)
+            p = map_point(ring[0])
+            self._test_neighborhood(p, set([ring[1], ring[-2]]))
+            output.append(p)
 
             output.extend(extract_shape(ring))
 
             # rings end on the same point they started
-            output.append(i)
+            output.append(p)
 
             return output
 
@@ -322,10 +330,6 @@ class TopoExtractor():
         '''compacts arcs by trying both a forward and reverse arc and returning the topojson index
         see https://github.com/topojson/topojson/wiki/Introduction#geometry-objects for more info
         on topojson indexes'''
-
-        # map all the arcs to lists, as they made be mutated later if we add
-        # more geojson sources
-        arc = list(map(lambda i: self._coordinates[i], arc))
 
         # search for arc in arcs index
         try:
