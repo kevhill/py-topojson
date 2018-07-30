@@ -1,28 +1,148 @@
-__version__ = '0.0.2'
+__version__ = '0.0.3'
 
 import json
 from collections import deque
 from math import inf
 from functools import reduce
 import copy
+from math import sqrt
 
 from collections import Sequence
 
+
 class TopoExtractor():
 
-    def __init__(self, precision=1e-7):
+    def __init__(self, precision=1e-7, point_match_threshold=None):
         self._precision = precision
 
-        self._junctions = set()
-        self._neighbors = dict()
+        if point_match_threshold is None:
+            self._point_match_threshold = precision
+        else:
+            assert(point_match_threshold >= precision)
+            self._point_match_threshold = point_match_threshold
 
         self.objects = {}
-        self.arcs = []
-        self.bbox = []
+        self._coordinates = []
+        self._junctions = set()
+        self._neighbors = {}
+        self._reset()
 
 
-    def set_geo_bbox(self, obj):
-        # recomputes correct bboxes for geometries
+    def _reset(self):
+        self._arcs = []
+        self._bbox = None
+        self._transform = None
+
+
+    def topify(self, obj):
+        # creates a proto-topology output. All objects will have real,
+        # unmodified coordinates. If bbox's are present, they will be
+        # removed
+
+        def topify_geometry(geo):
+            output = {'type': geo['type']}
+
+            # coordinates must be tuples to easily use in sets
+            # everything else should be lists to be mutable
+            if geo['type'] == 'Point':
+                # single coordinate alone
+                output['coordinates'] = tuple(geo['coordinates'])
+            elif geo['type'] in ['MultiPoint', 'LineString']:
+                # an array of coordinates
+                output['coordinates'] = list(map(tuple(geo['coordinates'])))
+            elif geo['type'] in ['MultiLineString', 'Polygon']:
+                # an array of arrays of coordinates
+                output['coordinates'] = list(map(lambda c: list(map(tuple, c)), geo['coordinates']))
+            elif geo['type'] == 'MultiPolygon':
+                # an array of arrays of arrays of coordinates
+                # this is mighty ugly in python
+                output['coordinates'] = list(map(lambda p: list(map(lambda c: list(map(tuple, c)), p)), geo['coordinates']))
+            elif geo['type'] in ['GeometryCollection']:
+                # call recursively to figure out a geometry collection
+                output['geometries'] = list(map(topify_geometry, geo['geometries']))
+
+            # if this is a topojson object, it might have properties
+            output.update({
+                key: geo[key] for key in ['id', 'properties'] if key in geo
+            })
+
+            return output
+
+
+        def topify_feature(feature):
+
+            output = topify_geometry(feature['geometry'])
+
+            # only include id and properties if they are present
+            output.update({
+                key: feature[key] for key in ['id', 'properties'] if key in feature
+            })
+
+            return output
+
+
+        def topify_feature_collection(feature_col):
+            output = {
+                'type': 'GeometryCollection',
+                'geometries': list(map(topify_feature, feature_col['features']))
+            }
+
+            return output
+
+
+        if obj['type'] == 'FeatureCollection':
+            output = topify_feature_collection(obj)
+        elif obj['type'] == 'Feature':
+            output = topify_feature(obj)
+        else:
+            output = topify_geometry(obj)
+
+        return output
+
+
+    def add_geo(self, geodict, name='default'):
+
+        self._reset()
+
+        if isinstance(geodict, str):
+            with open(geodict, 'r') as fp:
+                geodict = json.load(fp)
+
+        obj = self.topify(geodict)
+        obj = self.extract(obj)
+
+        if name in self.objects:
+
+            print('WARNING: topography already has object with name {}'.format(name))
+
+            if self.objects[name]['type'] != 'GeometryCollection':
+                # if what we have isn't already a GeometryCollection, we will need one
+                self.objects[name] = {
+                    'type': 'GeometryCollection',
+                    'geometries': [self.objects[name]]
+                }
+
+            if obj['type'] == 'GeometryCollection':
+                # if our new obj is a GeometryCollection, we can just concat the geometries
+                self.objects[name]['geometries'].extend(obj['geometries'])
+            else:
+                # otherwise, we just add the whole new obj to geometries
+                self.objects[name]['geometries'].add(obj)
+
+        else:
+            self.objects[name] = obj
+
+
+    def get_shape_coords(self, shape):
+        # return the actual coordinates for a simple shape given as a list of
+        # coordinate inedexes
+        return list(map(lambda i: self._coordinates[i], shape))
+
+
+    def get_bbox(self, obj=None):
+        # computes correct bboxes for geometries. If called with no object, get
+        # the bounding box for the instance by looking for bounding boxes of all
+        # objects
 
         def combMinMax(mm_a, mm_b):
             # each set should be in (min_p, max_p)
@@ -39,13 +159,15 @@ class TopoExtractor():
 
             return min_c, max_c
 
+
         def minMaxShape(shape):
             min_max = None
 
-            for p in shape:
+            for p in self.get_shape_coords(shape):
                 min_max = combMinMax((p, p), min_max)
 
             return min_max
+
 
         def minMax2Bbox(min_max):
             bbox = []
@@ -55,166 +177,179 @@ class TopoExtractor():
 
             return bbox
 
+
         def bbox2MinMax(bbox):
             return bbox[0::2], bbox[1::2]
+
 
         def minMaxPolygon(polygon):
             # polygons MUST have the outter ring as first element
             # see https://tools.ietf.org/html/rfc7946#section-3.1.6
             return minMaxShape(polygon[0])
 
+
         def combBbox(a, b):
             return minMax2Bbox(combMinMax(bbox2MinMax(a), bbox2MinMax(b)))
 
+
+        if obj is None:
+            return reduce(combBbox, map(self.get_bbox, self.objects.values()))
+
+        # if we already have a bbox, just return it
+        if 'bbox' in obj:
+            return obj['bbox']
+
         if obj['type'] == 'GeometryCollection':
-            deque(map(self.set_geo_bbox, obj['geometries']))
-            obj['bbox'] = reduce(combBbox, map(lambda g: g['bbox'], obj['geometries']))
+            return reduce(combBbox, map(self.get_bbox, obj['geometries']))
         elif obj['type'] == 'LineString':
-            obj['bbox'] = minMax2Bbox(minMaxShape(obj['arcs']))
+            return minMax2Bbox(minMaxShape(obj['coordinates']))
         elif obj['type'] == 'MultiLineString':
-            obj['bbox'] = minMax2Bbox(reduce(combMinMax, map(minMaxShape, obj['arcs'])))
+            return minMax2Bbox(reduce(combMinMax, map(minMaxShape, obj['coordinates'])))
         elif obj['type'] == 'Polygon':
-            obj['bbox'] = minMax2Bbox(minMaxPolygon(obj['arcs']))
+            return minMax2Bbox(minMaxPolygon(obj['coordinates']))
         elif obj['type'] == 'MultiPolygon':
-            obj['bbox'] = minMax2Bbox(reduce(combMinMax, map(minMaxPolygon, obj['arcs'])))
+            return minMax2Bbox(reduce(combMinMax, map(minMaxPolygon, obj['coordinates'])))
         elif obj['type'] == 'MultiPoint':
-            obj['bbox'] = minMax2Bbox(minMaxShape(obj['coordinates']))
-        elif obj['type'] == 'Topology':
-            obj['bbox'] = reduce(combBbox, map(lambda o: o['bbox'], obj['objects'].values()))
+            return minMax2Bbox(minMaxShape(obj['coordinates']))
 
 
-    def geomify(self, obj):
+    def _test_neighborhood(self, i, n):
+        # test to see if a point is a junction. if yes, add it to _junctions
+        # note uses point index here incase a new point has been mapped to
+        # an existing point
 
-        def recursive_tuple(seq):
-            for item in seq:
-                if isinstance(item, Sequence):
-                    yield tuple(recursive_tuple(item))
-                else:
-                    yield item
-
-        def get_if_present(d, keys):
-            if isinstance(keys, str):
-                keys = [keys]
-
-            return {
-                key: d[key] for key in keys if key in d
-            }
-
-        def geomifyGeometry(geo):
-            output = {'type': geo['type']}
-
-            if geo['type'] in ['GeometryCollection']:
-                output['geometries'] = list(map(geomifyGeometry, geo['geometries']))
-            elif geo['type'] in ['Point', 'MultiPoint']:
-                output['coordinates'] = geo['coordinates']
-            else:
-                output['arcs'] = list(recursive_tuple(geo['coordinates']))
-
-            return output
-
-        def geomifyFeature(feature):
-            output = geomifyGeometry(feature['geometry'])
-            output.update(get_if_present(feature, ['id', 'properties']))
-
-            return output
-
-        def geomifyFeatureCollection(featureCol):
-            output = {
-                'type': 'GeometryCollection',
-                'geometries': list(map(geomifyFeature, featureCol['features']))
-            }
-
-            return output
-
-        if obj['type'] == 'FeatureCollection':
-            output = geomifyFeatureCollection(obj)
-        elif obj['type'] == 'Feature':
-            output = geomifyFeature(obj)
-        else:
-            output = geomifyGeometry(obj)
-
-        self.set_geo_bbox(output)
-        return output
-
-
-    def test_neighborhood(self, p, n):
-        # test to see if a point is already a junction
-        if p in self._junctions:
+        if i in self._junctions:
             return
 
         # we only need to set one neighbor group per point because a point is
         # not a junction only if all neighbors are the same
-        t = self._neighbors.setdefault(p, n)
+        t = self._neighbors.setdefault(i, n)
         if n != t:
-            self._junctions.add(p)
+            self._junctions.add(i)
 
 
     def extract(self, obj):
-        # extract all the junctions
+        # extract all points and junctions, return lists of point indexes
 
-        def extractShape(shape):
+        obj = copy.deepcopy(obj)
+
+        def get_point_index(p):
+            # first map the point to our given precision, then compare with all
+            # other points based on our match_threshold
+
+            p = tuple(map(lambda d: round(d / self._precision) * self._precision, p))
+
+            for i, x in enumerate(self._coordinates):
+                sq_err = [(d[0] - d[1])**2 for d in zip(x, p)]
+                dist = sqrt(sum(sq_err))
+
+                if dist < self._point_match_threshold:
+                    return i
+
+            self._coordinates.append(p)
+            return len(self._coordinates) - 1
+
+
+        def extract_shape(shape):
+            output = []
+
             # all shapes must be tested for interior neighbors
-            for i, p in enumerate(shape[1:-1]):
+            for i_shp, p in enumerate(shape[1:-1]):
+
+                i_p = get_point_index(p)
+
                 # note that `i == shape.index(p) - 1` because of array slice
-                n = set([shape[i], shape[i + 2]])
-                self.test_neighborhood(p, n)
+                n = set([shape[i_shp], shape[i_shp + 2]])
+                self._test_neighborhood(i_p, n)
+
+                output.append(i_p)
+
+            return output
 
 
-        def extractLine(line):
-            # add first and last point to junctions
-            self._junctions.add(line[0])
-            self._junctions.add(line[-1])
+        def extract_line(line):
+            output = []
+            # first point is also by definition a junction
+            i = get_point_index(line[0])
+            self._junctions.add(i)
+            output.append(i)
 
-            extractShape(line)
+            #then we can test all interior points as normal
+            output.extend(extract_shape(line))
+
+            # the last point is also always a junction
+            i = get_point_index(line[i])
+            self._junctions.add(i)
+            output.append(i)
+
+            return output
 
 
-        def extractRing(ring):
+        def extract_ring(ring):
+            output = []
             # test neighbors of ring point
-            self.test_neighborhood(ring[0], set([ring[1], ring[-2]]))
+            i = get_point_index(ring[0])
+            self._test_neighborhood(i, set([ring[1], ring[-2]]))
+            output.append(i)
 
-            extractShape(ring)
+            output.extend(extract_shape(ring))
+
+            # rings end on the same point they started
+            output.append(i)
+
+            return output
 
 
-        def extractPolygon(polygon):
-            for ring in polygon:
-                extractRing(ring)
+        def extract_polygon(polygon):
+            return [extract_ring(ring) for ring in polygon]
 
 
+        ## TODO: All of this is now wrong. we return idexes and need to know where we plan to send them
         if obj['type'] == 'GeometryCollection':
-            deque(map(self.extract, obj['geometries']))
+            obj['geometries'] = list(map(self.extract, obj['geometries']))
         elif obj['type'] == 'LineString':
-            extractLine(obj['arcs'])
+            obj['coordinates'] = extract_line(obj['coordinates'])
         elif obj['type'] == 'MultiLineString':
-            deque(map(extractLine, obj['arcs']))
+            obj['coordinates'] = list(map(extract_line, obj['coordinates']))
         elif obj['type'] == 'Polygon':
-            extractPolygon(obj['arcs'])
+            obj['coordinates'] = extract_polygon(obj['coordinates'])
         elif obj['type'] == 'MultiPolygon':
-            deque(map(extractPolygon, obj['arcs']))
+            obj['coordinates'] = list(map(extract_polygon, obj['coordinates']))
 
+        return obj
 
-    def compact(self, arc):
-        '''compacts arcs by trying both a forward and reverse arc and returningthe topojson index
+    def add_arc(self, arc):
+        '''compacts arcs by trying both a forward and reverse arc and returning the topojson index
         see https://github.com/topojson/topojson/wiki/Introduction#geometry-objects for more info
         on topojson indexes'''
+
+        # map all the arcs to lists, as they made be mutated later if we add
+        # more geojson sources
+        arc = list(map(lambda i: self._coordinates[i], arc))
+
+        # search for arc in arcs index
         try:
-            return self.arcs.index(arc)
+            return self._arcs.index(arc)
         except ValueError:
             pass
 
+        # if it isn't forward, try reversed
         try:
-            # map all the arcs to lists, as they made be mutated later if we add
-            # more geojson sources
-            return -1 - self.arcs.index(list(reversed(arc)))
+            # reversed returns generator
+            return -1 - self._arcs.index(list(reversed(arc)))
         except ValueError:
             pass
 
-        self.arcs.append(list(arc))
-        return len(self.arcs) - 1
+        # otherwise, it is a new arc, add it
+        self._arcs.append(arc)
+        return len(self._arcs) - 1
 
 
     def cut(self, obj):
 
-        def cutShape(shape):
+        obj = copy.deepcopy(obj)
+
+        def cut_shape(shape):
             arc_indexes = []
 
             arc_start = 0
@@ -222,16 +357,16 @@ class TopoExtractor():
                 if p in self._junctions:
                     # note that `i == shape.index(p) - 1` because of array slice
                     arc = shape[arc_start:i + 2]
-                    arc_indexes.append(self.compact(arc))
+                    arc_indexes.append(self.add_arc(arc))
                     arc_start = i + 1
 
             #once we get to the end of the ring, put in the final arc
-            arc_indexes.append(self.compact(shape[arc_start:]))
+            arc_indexes.append(self.add_arc(shape[arc_start:]))
 
             return arc_indexes
 
 
-        def cutRing(ring):
+        def cut_ring(ring):
 
             # rotate ring to first junction, or leave alone if unconnected
             for offset, p in enumerate(ring):
@@ -239,66 +374,59 @@ class TopoExtractor():
                     ring = ring[offset:-1] + ring[:offset+1]
                     break
 
-            return cutShape(ring)
+            return cut_shape(ring)
 
-        def cutPolygon(polygon):
-            return list(map(cutRing, polygon))
-
+        def cut_polygon(polygon):
+            return list(map(cut_ring, polygon))
 
         if obj['type'] == 'GeometryCollection':
-            deque(map(self.cut, obj['geometries']))
+            obj['geometries'] = list(map(self.cut, obj['geometries']))
         elif obj['type'] == 'LineString':
-            obj['arcs'] = cutShape(obj['arcs'])
+            obj['arcs'] = cut_shape(obj['coordinates'])
         elif obj['type'] == 'MultiLineString':
-            obj['arcs'] = list(map(cutShape, obj['arcs']))
+            obj['arcs'] = list(map(cut_shape, obj['coordinates']))
         elif obj['type'] == 'Polygon':
-            obj['arcs'] = cutPolygon(obj['arcs'])
+            obj['arcs'] = cut_polygon(obj['coordinates'])
         elif obj['type'] == 'MultiPolygon':
-            obj['arcs'] = list(map(cutPolygon, obj['arcs']))
+            obj['arcs'] = list(map(cut_polygon, obj['coordinates']))
+
+        # if we still have coordinates, pop it
+        obj.pop('coordinates', None)
+
+        return obj
 
 
-    def add(self, geodict, name='default'):
+    def get_transform(self, bbox=None):
+        if bbox is None:
+            bbox = self.get_bbox()
 
-        if name in self.objects:
-            raise ValueError('object {} already exists in topography'.format(name))
+        translate = bbox[0::2]
+        scale = [self._precision] * len(translate)
 
-        if isinstance(geodict, str):
-            with open(geodict, 'r') as fp:
-                geodict = json.load(fp)
+        return {
+            'translate': translate,
+            'scale': scale
+        }
 
-        self.objects[name] = self.geomify(geodict)
-        self.extract(self.objects[name])
-        self.cut(self.objects[name])
 
-    def quantize(self, topo, n=None, scale=None):
+    def get_delta_arcs(self, transform=None):
         # quantized topographies must have a `transform` property at the top
         # level, and all arcs must be delta-encoded
 
-        bbox = topo['bbox']
+        if transform is None:
+            transform = self.get_transform()
 
-        # the translation is just the minimum of the bbox
-        translate = bbox[0::2]
+        translate = transform['translate']
+        scale = transform['scale']
 
-        if scale is None and n is None:
-            # If no scale info is provided, default to 1e-6 degree, which should
-            # be lossless for most applications but still reduce space signicantly
-            scale = [self._precision] * len(translate)
-        elif scale is None:
-            # If we just have an n, use that to compute optimal scale given our
-            # bbox range
-            max_p = bbox[1::2]
-            d = list(map(lambda min_p, max_p: max_p - min_p, translate, max_p))
-
-            scale = list(map(lambda x: x / (n-1), d))
-
-        def transformPoint(p):
+        def transform_point(p):
             return list(map(lambda v, t, s: round((v - t) / s), p, translate, scale))
 
-        def addDelta(arc, p):
-            return arc + [list(map(lambda x, y: x - y, transformPoint(p), arc[-1]))]
+        #def add_delta(arc, p):
+        #    return arc + [list(map(lambda x, y: x - y, transform_point(p), arc[-1]))]
 
-        def quantizeArc(arc):
-            arc = list(map(transformPoint, arc))
+        def delta_arc(arc):
+            arc = list(map(transform_point, arc))
             output = copy.deepcopy(arc)
 
             for i in range(1,len(arc)):
@@ -306,26 +434,38 @@ class TopoExtractor():
 
             return output
 
+        return list(map(delta_arc, self._arcs)),
 
-        topo.update({
-            'arcs': list(map(quantizeArc, topo['arcs'])),
-            'transform': {
-                'translate': translate,
-                'scale': scale
-            }
-        })
-
-        return topo
 
     def get_topo(self):
         topo = {
             'type': 'Topology',
-            'objects': self.objects,
-            'arcs': self.arcs
+            'objects': {},
         }
-        self.set_geo_bbox(topo)
 
-        return self.quantize(topo)
+        for name, obj in self.objects.items():
+
+            # find out the bbox before we cut up the obj
+            bbox = self.get_bbox(obj)
+
+            # .cut() modifies self to add arcs, and returns a new obj without
+            # coordinates and instead arc indexes
+            obj = self.cut(obj)
+
+            topo['objects'][name] = obj
+            topo['objects'][name]['bbox'] = bbox
+
+        bbox = self.get_bbox()
+        transform = self.get_transform(bbox)
+        arcs = self.get_delta_arcs(transform)
+
+        topo.update({
+            'bbox': bbox,
+            'transform': transform,
+            'arcs': arcs
+        })
+
+        return topo
 
     def dumps(self, *args, **kwargs):
         topo = self.get_topo()
